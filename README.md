@@ -1,1 +1,1 @@
-# COAP_and_MQTT
+Java Iot projects
