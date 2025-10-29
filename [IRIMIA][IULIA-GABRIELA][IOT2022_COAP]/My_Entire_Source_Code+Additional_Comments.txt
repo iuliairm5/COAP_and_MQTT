@@ -1,0 +1,589 @@
+//Student Name: IRIMIA IULIA-GABRIELA
+
+//the source code I started from: https://github.com/critoma/armasmiot/tree/master/labs/workspaceiotgwjava/CoapServer/java_samples/ws4d-jcoap-applications/src/org/ws4d/coap
+//on both the Client and Server, in order to run them, I added on both on the File-> Project Structure -> Libraries -> New Project Library JAVA (in IntelliJ IDEA) the json-20140107.jar and the jars from the lib folder(downloaded from https://github.com/critoma/armasmiot/tree/master/labs/workspaceiotgwjava/CoapServer/java_samples/ws4d-jcoap-applications/lib) 
+//for these jars to be included in the projects, on both Client and Server, on Project Structure->Modules I added/checked the jars as dependencies in the *.iml file
+//from the Client side I am doing 2 GET coaprequests and 1 POST coaprequest (first I am asking from the Server for his signature in order to validate it)
+//the Server will send his signature using response.setPayload(signature); this way, on the Client side, if hashes will match, I will know that the Server whose certificate I have is the right Server to communicate with
+//also the Server will encrypt the generated session_key using SecureRandom with Client's public key from the certificate; this way, only the Client will be able to decrypt it
+//this way both are validated to each other
+//the Client will receive all the needed data on the onResponse method by using response.getPayload() function;it will verify the signature (using Server's pub_key from certificate) and decrypt the session_key using his priv_key from his key_store
+//then the Client will encrypt the json payload using that decrypted session_key and will send that to the Server using POST coaprequest with setPayload(enc_payload)
+//then, on Server's side, on onRequest method, it will get that enc_payload using request.getPayload() and will decrypt it using that session_key also stored on the Server side
+//finally, on the Server side I will print the received and decrypted json payload
+//project sdk used: java version 14.0.1
+
+
+
+
+//ON THE CLIENT SIDE I HAVE TO PROVIDE FROM THE KEYBOARD THE LOCAL IP ADDRESS (THIS WILL BE THE SERVER), EXAMPLE: 192.168.X.Y 
+
+////////////////////////////////////////////////////////////////////////////////////////////////// CLIENT ///////////////////////////////////////////////////////////////////////////////////
+
+
+import java.io.*;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.Scanner;
+import java.util.concurrent.TimeUnit;
+
+import org.json.JSONObject;
+import org.w3c.dom.ls.LSOutput;
+import org.ws4d.coap.Constants;
+import org.ws4d.coap.connection.BasicCoapChannelManager;
+import org.ws4d.coap.interfaces.CoapChannelManager;
+import org.ws4d.coap.interfaces.CoapClient;
+import org.ws4d.coap.interfaces.CoapClientChannel;
+import org.ws4d.coap.interfaces.CoapRequest;
+import org.ws4d.coap.interfaces.CoapResponse;
+import org.ws4d.coap.messages.CoapEmptyMessage;
+import org.ws4d.coap.messages.CoapMediaType;
+import org.ws4d.coap.messages.CoapRequestCode;
+
+import javax.crypto.*;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+
+/**
+ * @author Christian Lerche <christian.lerche@uni-rostock.de>
+ */
+
+public class Client implements CoapClient {
+    private static String SERVER_ADDRESS ; //local IP address
+
+    private static int PORT = Constants.COAP_DEFAULT_PORT;
+    static int counter = 0;
+    CoapChannelManager channelManager = null;
+    CoapClientChannel clientChannel = null;
+
+    byte[] encrypted_session_Key = null;
+    byte[] dig_sig = null;
+    byte[] decrypted_session_Key = null;
+    static int flag=0;
+    static int ok=0;
+    static String payload;
+    static String encryptedPayload;
+    byte[] payloadEncBytes = null;
+    static PublicKey pub_key_Server = null;
+    public static void main(String[] args) throws InterruptedException, IOException, CertificateException {
+	/*if (args != null && args.length >= 1) {
+		SERVER_ADDRESS = args[0];
+		if (args.length >= 2)
+			PORT = Integer.parseInt(args[1]);
+	}*/
+        //Date date = Calendar.getInstance().getTime();
+        //DateFormat dateFormat = new SimpleDateFormat("yyyy-mm-dd hh:mm:ss");
+        //String strDate = dateFormat.format(date);
+        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("uuuu/MM/dd HH:mm:ss");
+        LocalDateTime now = LocalDateTime.now();
+        String strDate = dtf.format(now);
+        JSONObject jsonObject = new JSONObject();
+        jsonObject.put("temp", "20°C");
+        jsonObject.put("noise", "30dB");
+        jsonObject.put("humidity", "40%");
+        jsonObject.put("my_time", strDate);
+
+        payload = jsonObject.toString();
+
+        //System.out.println("Print JSON string :"+payload);
+        //System.out.println("My payload in bytes is "+ getHex(payload.getBytes()));
+
+        pub_key_Server = getCertificateKey ("ServerX509.cer");
+
+
+        System.out.println("★★ Please write the IP of the server (local IP address): ");
+        Scanner scan= new Scanner(System.in);
+        SERVER_ADDRESS=scan.nextLine();
+        System.out.println("Start CoAP Client: " + SERVER_ADDRESS);
+        System.out.println("★★ My payload as JSON :"+payload);
+        Client client = new Client();
+        client.channelManager = BasicCoapChannelManager.getInstance();
+        client.runTestClient0();
+        TimeUnit.SECONDS.sleep(2);
+        flag=1;
+        client.runTestClient();
+        TimeUnit.SECONDS.sleep(2);
+        if(ok==1) client.runTestClient2();
+    }
+
+    public void runTestClient0(){
+        try {
+            clientChannel = channelManager.connect(this, InetAddress.getByName(SERVER_ADDRESS), PORT);
+            CoapRequest coapRequestKey0 = clientChannel.createRequest(true, CoapRequestCode.GET);
+            clientChannel.sendMessage(coapRequestKey0);
+            System.out.println("Sent Request : GET the signature in order to validate the Server");
+
+
+        } catch (UnknownHostException e) {
+            e.printStackTrace();
+        }
+    }
+
+
+    public void runTestClient(){
+        try {
+            clientChannel = channelManager.connect(this, InetAddress.getByName(SERVER_ADDRESS), PORT);
+            CoapRequest coapRequestKey = clientChannel.createRequest(true, CoapRequestCode.GET);
+            clientChannel.sendMessage(coapRequestKey);
+            System.out.println("Sent Request : GET the encrypted session key");
+
+
+        } catch (UnknownHostException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void runTestClient2(){
+        try {
+            clientChannel = channelManager.connect(this, InetAddress.getByName(SERVER_ADDRESS), PORT);
+
+                    // SENT THE ENCRYPTED JSON PAYLOAD TO THE SERVER
+                    CoapRequest coapRequestEncPayload = clientChannel.createRequest(true, CoapRequestCode.POST);
+                    //coapRequestEncPayload.setUriPath(encryptedPayload);
+                    coapRequestEncPayload.setPayload(payloadEncBytes);
+                    clientChannel.sendMessage(coapRequestEncPayload);
+                    System.out.println("Sent Request : POST the encrypted payload");
+
+        } catch (UnknownHostException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onConnectionFailed(CoapClientChannel channel, boolean notReachable, boolean resetByServer) {
+        System.out.println("Connection Failed");
+    }
+
+    @Override
+    public void onResponse(CoapClientChannel channel, CoapResponse response)  {
+        //verify the signature
+        if (flag==0) {
+
+            dig_sig = response.getPayload();
+            //System.out.println("Dig_sign is "+getHex(dig_sig));
+            System.out.println("★★ I've received the digital signature from the server !");
+        }
+
+        if(flag==1) {
+            System.out.println("★★ I've received the encrypted session key from the server !!");
+            encrypted_session_Key = response.getPayload();
+
+            //System.out.println("Enc_session_key is "+getHex(encrypted_session_Key));
+
+            try {
+                if (hasValidSignature( encrypted_session_Key, pub_key_Server,dig_sig))
+                {
+                    ok = 1;
+                    System.out.println("★★ The server is validated!");
+                }
+                else System.out.println("The server is not validated!");
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+            } catch (SignatureException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+        if(flag==1 && ok==1) {
+
+            //1)get client's private key from his keystore
+            KeyStore ks = null;
+            PrivateKey privKeyClient = null;
+            
+            try {
+                ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                char[] password = "passks".toCharArray();
+                java.io.FileInputStream fis = new java.io.FileInputStream("myclient.ks");
+                ks.load(fis, password);
+                fis.close();
+                privKeyClient = (PrivateKey) ks.getKey("ismkey1", password);
+
+                //2) decrypt the session key
+                decrypted_session_Key = decryptRSA(privKeyClient, encrypted_session_Key);
+                System.out.println("★★ I've decrypted the session key !!");
+                //System.out.println("Decrypted session key: "+getHex(decrypted_session_Key));
+                //flag=1;
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+                byte[] iv = new byte[]{0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF};
+                IvParameterSpec ivSpec = new IvParameterSpec(iv);
+                Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding");
+                SecretKeySpec key = new SecretKeySpec(decrypted_session_Key, "AES");
+                //System.out.println("Session key: "+getHex(key.getEncoded()));
+
+                cipher.init(Cipher.ENCRYPT_MODE, key, ivSpec);
+                //System.out.println("number of input bytes is "+payload.getBytes().length);
+                payloadEncBytes = cipher.doFinal(payload.getBytes());
+                System.out.println("★★ I've encrypted the payload !! Now I'll send it to the server !!");
+
+                //encryptedPayload = new String(payloadEncBytes, StandardCharsets.UTF_8);
+                //System.out.println("Encrypted payload: " + getHex(payloadEncBytes));
+
+            } catch (KeyStoreException | FileNotFoundException e) {
+                e.printStackTrace();
+            } catch (CertificateException e) {
+                e.printStackTrace();
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (UnrecoverableKeyException e) {
+                e.printStackTrace();
+            } catch (NoSuchPaddingException e) {
+                e.printStackTrace();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+            } catch (IllegalBlockSizeException e) {
+                e.printStackTrace();
+            } catch (BadPaddingException e) {
+                e.printStackTrace();
+            } catch (InvalidAlgorithmParameterException e) {
+                e.printStackTrace();
+            }
+
+        }
+    }
+
+    //////////////////////////////////////////////////////////////
+    public static byte[] decryptRSA(Key key, byte[] input) throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, BadPaddingException, IllegalBlockSizeException {
+        Cipher cipher = Cipher.getInstance("RSA");
+        cipher.init(Cipher.DECRYPT_MODE,key);
+        return cipher.doFinal(input);
+    }
+    public static String getHex(byte[] array) //as byte array
+    {
+        String output= "";
+        for(byte value :array) //for each byte value in the array
+        {
+            output += String.format("%02x",value);
+        }
+        return output;
+    }
+
+    public static boolean hasValidSignature(byte[] enc_key , PublicKey key, byte[] digitalSignature) throws IOException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initVerify(key); //initialize for verifying
+        //need to recompute the digital signature
+        signature.update(enc_key);
+        return signature.verify(digitalSignature); //will check the recomputed digital signature with the one given as argument//returns true or false
+
+    }
+
+    public static PublicKey getCertificateKey (String certificateFile) throws IOException, CertificateException {
+        File file = new File(certificateFile);
+        if(!file.exists())
+        {
+            System.out.println("No certificate file available");
+            throw new FileNotFoundException();
+        }
+        FileInputStream fis = new FileInputStream(file);
+        //to open the certificate
+        CertificateFactory certFactory = CertificateFactory.getInstance("X.509");//we can open 509 certificates
+        X509Certificate certificate = (X509Certificate) certFactory.generateCertificate(fis);//we have the certificate object
+
+        fis.close();
+        return certificate.getPublicKey(); //returns the public key
+    }
+}
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////////////////////// SERVER ///////////////////////////////////////////////////////////////////////////////////
+
+
+/* Copyright [2011] [University of Rostock]
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *    http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *****************************************************************************/
+
+
+
+import org.ws4d.coap.connection.BasicCoapChannelManager;
+import org.ws4d.coap.interfaces.CoapChannelManager;
+import org.ws4d.coap.interfaces.CoapMessage;
+import org.ws4d.coap.interfaces.CoapRequest;
+import org.ws4d.coap.interfaces.CoapServer;
+import org.ws4d.coap.interfaces.CoapServerChannel;
+import org.ws4d.coap.messages.CoapMediaType;
+import org.ws4d.coap.messages.CoapResponseCode;
+
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.Base64;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * @author Christian Lerche <christian.lerche@uni-rostock.de>
+ */
+
+public class Server implements CoapServer {
+    private static final int PORT = 5683;
+    static int counter = 0;
+    static byte[] encrypted_session_Key = null;
+   static byte[] session_key = null;
+   static PrivateKey server_priv_key = null;
+    byte[] session_key2 = null;
+    byte[] encrypted_payload = null;
+    byte[] encrypted_payload2 = null;
+    static PublicKey pubKeyClient= null;;
+    static PublicKey pubKeyClient2= null;;
+    static int flag=0;
+    static byte[] server_signature = null;
+    static SecretKeySpec skeySpec = null;
+    public static void main(String[] args) throws KeyStoreException, IOException, NoSuchAlgorithmException, CertificateException {
+        System.out.println("Start CoAP Server on port " + PORT);
+        Server server = new Server();
+
+        CoapChannelManager channelManager = BasicCoapChannelManager.getInstance();
+        channelManager.createServerListener(server, PORT);
+
+        //////////////////////////////////////////////////////////////
+        //preparing the symmetric key (session key)
+        //I assumed I have on the server side the certificate of the client
+        //i want to encrypt the generated symmetric key using the public key of the client extracted from the certificate
+        //1) extract the client's public key from his certificate
+
+        pubKeyClient2 = getCertificateKey("ClientCertificateX509.cer");
+
+        //2) generate the session key
+        SecureRandom secureRandom = null;
+        secureRandom = SecureRandom.getInstance("SHA1PRNG");
+        session_key = new byte[16]; //16B for the key
+        secureRandom.nextBytes(session_key);
+        ///////////////////////////////////////////////////////
+    }
+
+    @Override
+    public CoapServer onAccept(CoapRequest request) {
+        System.out.println("Accept connection...");
+        flag++;
+        return this;
+    }
+
+    @Override
+    public void onRequest(CoapServerChannel channel, CoapRequest request) {
+        //System.out.println("Received message: " + request.toString()+ " URI: " + request.getUriPath());
+
+        CoapMessage response1 = channel.createResponse(request, CoapResponseCode.Content_205);
+        response1.setContentType(CoapMediaType.text_plain);
+
+        //send the signature to the client
+        if(flag==1)
+        {
+            KeyStore ks = null;
+            try {
+                ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                char[] password = "passks".toCharArray();
+                java.io.FileInputStream fis = new java.io.FileInputStream("myserver.ks");
+                ks.load(fis, password);
+                fis.close();
+                server_priv_key = (PrivateKey) ks.getKey("ismkey1", password);
+                //3)encrypt the session key with the pubKeyClient & prepare signature
+                encrypted_session_Key = encryptRSA(pubKeyClient2, session_key);
+                server_signature = getDigitalSignature(encrypted_session_Key, server_priv_key);
+
+                response1.setPayload(server_signature);
+                channel.sendMessage(response1);
+                System.out.println("★★ Sending the digital signature to the client !!");
+            } catch (KeyStoreException | FileNotFoundException e) {
+                e.printStackTrace();
+            } catch (SignatureException e) {
+                e.printStackTrace();
+            } catch (NoSuchPaddingException e) {
+                e.printStackTrace();
+            } catch (BadPaddingException e) {
+                e.printStackTrace();
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            } catch (CertificateException e) {
+                e.printStackTrace();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+            } catch (UnrecoverableKeyException e) {
+                e.printStackTrace();
+            } catch (IOException e) {
+                e.printStackTrace();
+            } catch (IllegalBlockSizeException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+        if(flag==2) {
+
+            //4)send the encrypted session key to the client
+            //response.setPayload("payload...".getBytes());
+            response1.setPayload(encrypted_session_Key);
+            if (request.getObserveOption() != null) {
+                System.out.println("Client wants to observe this resource.");
+            }
+            response1.setObserveOption(1);
+            channel.sendMessage(response1);
+            System.out.println("★★ Sending the encrypted session key to the client !!");
+
+
+        }
+/////////////////////////////////////////////////////////////
+        //System.out.println("Received message: " + request.toString()+ " URI: " + request.getUriPath());
+        //CoapMessage response2 = channel.createResponse(request, CoapResponseCode.Content_205);
+        //response2.setContentType(CoapMediaType.text_plain);
+
+        if(flag==3) {
+            encrypted_payload = request.getPayload();//OK
+            encrypted_payload2 = Arrays.copyOf(encrypted_payload, encrypted_payload.length);
+            //flag=1;
+            //System.out.println("The received encrypted payload is : " + getHex(encrypted_payload2));
+            System.out.println("★★ I've received the encrypted payload from the client !!");
+
+            byte[] iv = new byte[]{0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF};
+            IvParameterSpec ivSpec = new IvParameterSpec(iv);
+            Cipher cipher2;
+            skeySpec = new SecretKeySpec(session_key, "AES"); //OK
+            // System.out.println("Session key: " + getHex(skeySpec.getEncoded()));
+            try {
+                cipher2 = Cipher.getInstance("AES/CBC/NoPadding");
+                //cipher.init(Cipher.DECRYPT_MODE, skeySpec, ivSpec);
+                cipher2.init(Cipher.DECRYPT_MODE, skeySpec, ivSpec);
+
+                byte[] payloadDecBytes = cipher2.doFinal(encrypted_payload2);
+
+                String decryptedPayload = new String(payloadDecBytes, StandardCharsets.UTF_8);
+
+                System.out.println("★★ My decrypted payload is: " + decryptedPayload);
+                //System.out.println("My decrypted payload in bytes is:" + getHex(payloadDecBytes));
+                flag=4;
+
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            } catch (NoSuchPaddingException e) {
+                e.printStackTrace();
+            } catch (BadPaddingException e) {
+                e.printStackTrace();
+            } catch (IllegalBlockSizeException e) {
+                e.printStackTrace();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+            } catch (InvalidAlgorithmParameterException e) {
+                e.printStackTrace();
+            }
+
+        }
+
+    }
+
+    @Override
+    public void onSeparateResponseFailed(CoapServerChannel channel) {
+        System.out.println("Separate response transmission failed.");
+
+    }
+
+/////////////////////////////////////////////////////////
+    public static byte[] encryptRSA(Key key, byte[] input) throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, BadPaddingException, IllegalBlockSizeException, BadPaddingException, IllegalBlockSizeException {
+        Cipher cipher = Cipher.getInstance("RSA");//RSA works as a stream cipher (take 1B at a time)
+        cipher.init(Cipher.ENCRYPT_MODE,key);
+        return cipher.doFinal(input); //process the entire buffer
+    }
+
+    public static String getHex(byte[] array) //as byte array
+    {
+        String output= "";
+        for(byte value :array) //for each byte value in the array
+        {
+            output += String.format("%02x",value);
+        }
+        return output;
+    }
+
+    public static PublicKey getCertificateKey (String certificateFile) throws IOException, CertificateException {
+        File file = new File(certificateFile);
+        if(!file.exists())
+        {
+            System.out.println("No certificate file available");
+            throw new FileNotFoundException();
+        }
+        FileInputStream fis = new FileInputStream(file);
+        //to open the certificate
+        CertificateFactory certFactory = CertificateFactory.getInstance("X.509");//we can open 509 certificates
+        X509Certificate certificate = (X509Certificate) certFactory.generateCertificate(fis);//we have the certificate object
+
+        fis.close();
+        return certificate.getPublicKey(); //returns the public key
+    }
+
+    //to generate a digital signature (computing a hash and encrypting it with a private key)
+    public static byte[] getDigitalSignature(byte[] mybyte, PrivateKey key) throws IOException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+
+        //to generate the signature
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(key);
+
+        //let's sign the document
+        signature.update(mybyte);
+        return signature.sign(); //we get the signature of our byte[]
+    }
+
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

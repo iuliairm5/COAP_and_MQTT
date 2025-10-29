@@ -1,0 +1,408 @@
+//Student Name: IRIMIA IULIA-GABRIELA
+
+//the publisher validates the subscriber through his private key (because the session_key is generated on the Publisher side and published encrypted using the Subscriber's public_key extracted from the certificate)
+//the subscriber validates the publisher through his digital signature (so the content can be decrypted using only the public_key/certificate of the publisher which I want to access as a subscriber); this way I will know that my data comes from a trusted source
+//if the hashes match, the subscriber will decrypt the session key with his priv_key and then will decrypt the encrypted payload using that decrypted session_key
+//the payload is in a json form as in the CoAP project
+//the subscriber is subscribed to 3 topics (validate_sender, enc_session_key, enc_payload), so all of these 3 topics are published by the Publisher
+//to publish data, I used mqttmessage m , m.setPayload(data) and client.publish(topic_name,m)
+//in order to subscribe, on Subscriber Main's I used client.subscribe(topic_name) and client.setCallBack (to receive all the data in the messageArrived method by using mqttMessage.getPayload() )
+//to run these 2 Clients, I added on both on the File-> Project Structure -> Libraries -> New Project Library JAVA (in IntelliJ IDEA) the following 2 jars: org.eclipse.paho.client.mqttv3-1.2.5.jar and json-20140107.jar (both added in the project as files)
+//for these jars to be included in the projects, on both clients on Project Structure->Modules I added/checked both jars as dependencies in the *.iml file
+//the MQTT broker used is test.mosquitto.org:1883
+//the source code I started from : https://github.com/tgrall/mqtt-sample-java/tree/master/src/main/java/com/mapr/demo/mqtt/simple
+//from where I downloaded the org.eclipse.paho.client.mqttv3-1.2.5.jar : https://search.maven.org/search?q=a:org.eclipse.paho.client.mqttv3
+//project sdk used: java version 14.0.1
+
+
+
+
+//THE SUBSCRIBER SHOULD RUN FIRST (to be in listen mode) AND THEN THE PUBLISHER !! (because the subscriber will catch the topics posted when the publisher will run)
+
+/////////////////////////////////////////////////////////////////////////////////////// PUBLISHER ///////////////////////////////////////////////////////////////////////////////////////////
+
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+import org.json.JSONObject;
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+
+public class Publisher {
+
+    static byte[] encrypted_session_Key = null;
+    static byte[] session_key = null;
+    static PublicKey pubKeySubscriber = null;
+    static byte[] payloadEncBytes = null;
+    static String encryptedPayload;
+    static byte[] publisher_signature = null;
+    public static void main(String[] args) throws MqttException, NoSuchAlgorithmException, IOException, CertificateException, IllegalBlockSizeException, InvalidKeyException, BadPaddingException, NoSuchPaddingException, InvalidAlgorithmParameterException {
+
+       // String messageString = "Hello World from Java!";
+
+        //1) preparing the payload
+        String jsonPayload ;
+        DateTimeFormatter dtf = DateTimeFormatter.ofPattern("uuuu/MM/dd HH:mm:ss");
+        LocalDateTime now = LocalDateTime.now();
+        String strDate = dtf.format(now);
+        JSONObject jsonObject = new JSONObject();
+        jsonObject.put("temp", "20°C");
+        jsonObject.put("noise", "30dB");
+        jsonObject.put("humidity", "40%");
+        jsonObject.put("my_time", strDate);
+
+        jsonPayload = jsonObject.toString();
+
+        //2) generate the session key
+        SecureRandom secureRandom = null;
+        secureRandom = SecureRandom.getInstance("SHA1PRNG");
+        session_key = new byte[16]; //16B for the key
+        secureRandom.nextBytes(session_key);
+
+        //3) extract the subscriber's public key from his certificate
+        pubKeySubscriber = getCertificateKey("SubscriberX509.cer");
+
+        //4) encrypt the session key
+
+        encrypted_session_Key = encryptRSA(pubKeySubscriber,session_key);
+
+        ////////////////////////////////////////////////////////////////////////////
+
+        //5) encrypt the payload using the session key
+
+        byte[] iv = new byte[]{0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF};
+        IvParameterSpec ivSpec = new IvParameterSpec(iv);
+        Cipher cipher = Cipher.getInstance("AES/CBC/NoPadding");
+        SecretKeySpec key = new SecretKeySpec(session_key, "AES");
+        cipher.init(Cipher.ENCRYPT_MODE, key, ivSpec);
+
+        payloadEncBytes = cipher.doFinal(jsonPayload.getBytes());
+
+       // encryptedPayload = new String(payloadEncBytes, StandardCharsets.UTF_8);
+
+        ///////////////////////////////////////////////////////////////////////////
+
+        MemoryPersistence persistence = new MemoryPersistence();
+        System.out.println("== START PUBLISHER ==");
+        MqttClient client = new MqttClient("tcp://test.mosquitto.org:1883", MqttClient.generateClientId(),persistence);
+        System.out.println("★★ My session key is : " + getHex(session_key));
+        client.connect();
+
+        //send the digital signature to validate the sender(the publisher) on the subscriber side
+        //we need the publisher's private key from his keystore
+        KeyStore ks = null;
+        PrivateKey publisher_priv_key = null;
+        try {
+            ks = KeyStore.getInstance(KeyStore.getDefaultType());
+            char[] password = "passks".toCharArray();
+            java.io.FileInputStream fis = new java.io.FileInputStream("publisher.ks");
+            ks.load(fis, password);
+            fis.close();
+            publisher_priv_key = (PrivateKey) ks.getKey("ismkey1", password);
+
+
+            publisher_signature = getDigitalSignature(encrypted_session_Key, publisher_priv_key);
+        } catch (UnrecoverableKeyException e) {
+            e.printStackTrace();
+        } catch (KeyStoreException e) {
+            e.printStackTrace();
+        } catch (SignatureException e) {
+            e.printStackTrace();
+        }
+        MqttMessage m0 = new MqttMessage();
+        m0.setPayload(publisher_signature);
+
+        client.publish("validate_sender", m0);
+        System.out.println("★★ Validate_sender_message published !");
+
+
+        //send enc_session key to the subscriber
+        MqttMessage m1 = new MqttMessage();
+        m1.setPayload(encrypted_session_Key);
+
+        client.publish("enc_key", m1);
+
+       // System.out.println("My enc key is: "+getHex(encrypted_session_Key));
+        System.out.println("★★ Enc_session_key_message published !");
+
+        //send encrypted payload to the subscriber
+        MqttMessage m2 = new MqttMessage();
+        m2.setPayload(payloadEncBytes);
+
+        client.publish("enc_payload", m2);
+        System.out.println("★★ Enc_payload_message published !");
+       // System.out.println("Encrypted payload published: " + getHex(payloadEncBytes));
+
+
+        client.disconnect();
+        System.out.println("== END PUBLISHER ==");
+
+    }
+////////////////////////////////////////////////////////////////////////////////
+public static PublicKey getCertificateKey (String certificateFile) throws IOException, CertificateException {
+    File file = new File(certificateFile);
+    if(!file.exists())
+    {
+        System.out.println("No certificate file available");
+        throw new FileNotFoundException();
+    }
+    FileInputStream fis = new FileInputStream(file);
+    //to open the certificate
+    CertificateFactory certFactory = CertificateFactory.getInstance("X.509");//we can open 509 certificates
+    X509Certificate certificate = (X509Certificate) certFactory.generateCertificate(fis);//we have the certificate object
+
+    fis.close();
+    return certificate.getPublicKey(); //returns the public key
+}
+
+    public static byte[] encryptRSA(Key key, byte[] input) throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, BadPaddingException, IllegalBlockSizeException, BadPaddingException, IllegalBlockSizeException {
+        Cipher cipher = Cipher.getInstance("RSA");//RSA works as a stream cipher (take 1B at a time)
+        cipher.init(Cipher.ENCRYPT_MODE,key);
+        return cipher.doFinal(input); //process the entire buffer
+    }
+
+    public static String getHex(byte[] array) //as byte array
+    {
+        String output= "";
+        for(byte value :array) //for each byte value in the array
+        {
+            output += String.format("%02x",value);
+        }
+        return output;
+    }
+
+    //to generate a digital signature (computing a hash and encrypting it with a private key)
+    public static byte[] getDigitalSignature(byte[] mybyte, PrivateKey key) throws IOException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+
+        //to generate the signature
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(key);
+
+        //let's sign the document
+        signature.update(mybyte);
+        return signature.sign(); //we get the signature of our byte[]
+    }
+
+}
+
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////// SUBSCRIBER //////////////////////////////////////////////////////////////////////////////////////////
+
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.persist.MemoryPersistence;
+
+import java.util.concurrent.TimeUnit;
+
+public class Subscriber {
+
+    //static int flag=0;
+    public static void main(String[] args) throws MqttException, InterruptedException {
+
+        System.out.println("== START SUBSCRIBER ==");
+        MemoryPersistence persistence = new MemoryPersistence();
+        MqttClient client = new MqttClient("tcp://test.mosquitto.org:1883", MqttClient.generateClientId(),persistence);
+        client.setCallback( new SimpleMqttCallBack() );
+        client.connect();
+
+        client.subscribe("validate_sender");
+        client.subscribe("enc_key");
+        //TimeUnit.SECONDS.sleep(5);
+        client.subscribe("enc_payload");
+    }
+
+}
+
+
+
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+import javax.crypto.BadPaddingException;
+import javax.crypto.Cipher;
+import javax.crypto.IllegalBlockSizeException;
+import javax.crypto.NoSuchPaddingException;
+import javax.crypto.spec.IvParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.cert.CertificateException;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.concurrent.TimeUnit;
+
+public class SimpleMqttCallBack implements MqttCallback {
+
+    static int ok=0;
+    static int flag=0;
+    static byte[] encrypted_session_Key = null;
+    static byte[] dig_signature = null;
+    static byte[] decrypted_session_Key = null;
+    static byte[] encrypted_payload = null;
+    static SecretKeySpec skeySpec = null;
+    public void connectionLost(Throwable throwable) {
+        System.out.println("Connection to MQTT broker lost!");
+    }
+
+    public void messageArrived(String s, MqttMessage mqttMessage) throws Exception {
+        flag++;
+        if(flag==1) dig_signature = mqttMessage.getPayload();
+        if(flag==2 ) {
+            //System.out.println("Message received:\t"+ new String(mqttMessage.getPayload()) );
+            //System.out.println("Encrypted session key received: "+getHex(mqttMessage.getPayload()));
+
+            encrypted_session_Key = mqttMessage.getPayload();
+
+            //check the signature first
+            if(hasValidSignature(encrypted_session_Key,getCertificateKey("PublisherX509.cer"),dig_signature))
+            {
+                ok = 1;
+                System.out.println("★★ The publisher is validated!");
+                //get subscriber's private key from his keystore
+                KeyStore ks = null;
+                PrivateKey privKeySubscriber = null;
+                try {
+                    ks = KeyStore.getInstance(KeyStore.getDefaultType());
+                    char[] password = "passks".toCharArray();
+                    java.io.FileInputStream fis = new java.io.FileInputStream("subscriber.ks");
+                    ks.load(fis, password);
+                    fis.close();
+                    privKeySubscriber = (PrivateKey) ks.getKey("ismkey1", password);
+
+                    // decrypt the session key
+                    decrypted_session_Key = decryptRSA(privKeySubscriber, encrypted_session_Key);
+                    //System.out.println("★★ I've decrypted the session key !!");
+                    System.out.println("★★ My decrypted session key is: " + getHex(decrypted_session_Key));
+
+                } catch (KeyStoreException | FileNotFoundException e) {
+                    e.printStackTrace();
+                } catch (CertificateException e) {
+                    e.printStackTrace();
+                } catch (NoSuchAlgorithmException e) {
+                    e.printStackTrace();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } catch (UnrecoverableKeyException e) {
+                    e.printStackTrace();
+                } catch (NoSuchPaddingException e) {
+                    e.printStackTrace();
+                } catch (InvalidKeyException e) {
+                    e.printStackTrace();
+                } catch (IllegalBlockSizeException e) {
+                    e.printStackTrace();
+                } catch (BadPaddingException e) {
+                    e.printStackTrace();
+                }
+            }
+
+
+            else{
+                System.out.println("The publisher is not validated!");
+            }
+
+        }
+
+        //get encrypted payload
+        if(flag==3 && ok==1) {
+            encrypted_payload = mqttMessage.getPayload();
+            //System.out.println("The received encrypted payload is : " + getHex(encrypted_payload));
+
+            // decrypt the payload
+            byte[] iv = new byte[]{0x0, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x8, 0x9, 0xA, 0xB, 0xC, 0xD, 0xE, 0xF};
+            IvParameterSpec ivSpec = new IvParameterSpec(iv);
+            Cipher cipher;
+            skeySpec = new SecretKeySpec(decrypted_session_Key, "AES");
+            try {
+                cipher = Cipher.getInstance("AES/CBC/NoPadding");
+                cipher.init(Cipher.DECRYPT_MODE, skeySpec, ivSpec);
+                byte[] payloadDecBytes = cipher.doFinal(encrypted_payload);
+                String decryptedPayload = new String(payloadDecBytes, StandardCharsets.UTF_8);
+                System.out.println("★★ My decrypted payload is: " + decryptedPayload);
+                flag=0;
+                ok=0;
+
+            } catch (NoSuchAlgorithmException e) {
+                e.printStackTrace();
+            } catch (NoSuchPaddingException e) {
+                e.printStackTrace();
+            } catch (BadPaddingException e) {
+                e.printStackTrace();
+            } catch (IllegalBlockSizeException e) {
+                e.printStackTrace();
+            } catch (InvalidKeyException e) {
+                e.printStackTrace();
+            } catch (InvalidAlgorithmParameterException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
+    public void deliveryComplete(IMqttDeliveryToken iMqttDeliveryToken) {
+
+    }
+    ///////////////////////////////////////////////////////////////////////////////////
+    public static String getHex(byte[] array) //as byte array
+    {
+        String output= "";
+        for(byte value :array) //for each byte value in the array
+        {
+            output += String.format("%02x",value);
+        }
+        return output;
+    }
+    public static byte[] decryptRSA(Key key, byte[] input) throws NoSuchPaddingException, NoSuchAlgorithmException, InvalidKeyException, BadPaddingException, IllegalBlockSizeException {
+        Cipher cipher = Cipher.getInstance("RSA");
+        cipher.init(Cipher.DECRYPT_MODE,key);
+        return cipher.doFinal(input);
+    }
+
+    public static boolean hasValidSignature(byte[] enc_key , PublicKey key, byte[] digitalSignature) throws IOException, NoSuchAlgorithmException, InvalidKeyException, SignatureException {
+
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initVerify(key); //initialize for verifying
+        //need to recompute the digital signature
+        signature.update(enc_key);
+        return signature.verify(digitalSignature); //will check the recomputed digital signature with the one given as argument//returns true or false
+
+    }
+    public static PublicKey getCertificateKey (String certificateFile) throws IOException, CertificateException {
+        File file = new File(certificateFile);
+        if(!file.exists())
+        {
+            System.out.println("No certificate file available");
+            throw new FileNotFoundException();
+        }
+        FileInputStream fis = new FileInputStream(file);
+        //to open the certificate
+        CertificateFactory certFactory = CertificateFactory.getInstance("X.509");//we can open 509 certificates
+        X509Certificate certificate = (X509Certificate) certFactory.generateCertificate(fis);//we have the certificate object
+
+        fis.close();
+        return certificate.getPublicKey(); //returns the public key
+    }
+}
+
